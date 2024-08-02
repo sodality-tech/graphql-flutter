@@ -253,23 +253,23 @@ class GraphQLClient implements GraphQLDataProxy {
       );
 
   /// pass through to [cache.writeQuery] and then rebroadcast any changes.
-  void writeQuery(request, {required data, broadcast = true}) {
+  Future<void> writeQuery(request, {required data, broadcast = true}) async {
     cache.writeQuery(request, data: data, broadcast: broadcast);
-    queryManager.maybeRebroadcastQueries();
+    await queryManager.maybeRebroadcastQueries();
   }
 
   /// pass through to [cache.writeFragment] and then rebroadcast any changes.
-  void writeFragment(
+  Future<void> writeFragment(
     fragmentRequest, {
     broadcast = true,
     required data,
-  }) {
+  }) async {
     cache.writeFragment(
       fragmentRequest,
       broadcast: broadcast,
       data: data,
     );
-    queryManager.maybeRebroadcastQueries();
+    await queryManager.maybeRebroadcastQueries();
   }
 
   /// Resets the contents of the store with [cache.store.reset()]

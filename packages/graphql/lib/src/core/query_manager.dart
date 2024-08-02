@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:gql/ast.dart';
 import 'package:graphql/src/utilities/response.dart';
+import 'package:isolate_pool_2/isolate_pool_2.dart';
 import 'package:meta/meta.dart';
 import 'package:collection/collection.dart';
 
@@ -19,16 +20,107 @@ import 'package:graphql/src/exceptions.dart';
 import 'package:graphql/src/scheduler/scheduler.dart';
 
 import 'package:graphql/src/core/_query_write_handling.dart';
+import 'package:normalize/normalize.dart';
+import 'package:normalize/utils.dart';
+
+import '../cache/_optimistic_transactions.dart';
 
 bool Function(dynamic a, dynamic b) _deepEquals =
     const DeepCollectionEquality().equals;
+
+class ReadCacheJob extends PooledJob<Map<String, dynamic>?> {
+  // GraphQLCache cache;
+  Request request;
+  bool optimistic;
+
+  ReadCacheJob(this.request, {this.optimistic = false});
+
+  @override
+  Future<Map<String, dynamic>?> job() async {
+    return _isolateCache?.readQuery(request, optimistic: optimistic);
+  }
+}
+
+GraphQLCache? _isolateCache;
+
+class WarmUpIsolateCacheJob extends PooledJob<void> {
+  GraphQLCache cache;
+
+  WarmUpIsolateCacheJob(this.cache);
+
+  @override
+  Future<void> job() async {
+    _isolateCache = this.cache;
+  }
+}
+
+class DenormalizeJob extends PooledJob<Map<String, dynamic>?> {
+  // Additional fields needed for denormalization
+  DocumentNode document;
+  String? operationName;
+  bool optimistic;
+  Map<String, dynamic> variables;
+  Map<String, TypePolicy> typePolicies;
+  DataIdResolver? dataIdFromObject;
+  bool addTypename;
+  bool returnPartialData;
+  bool allowDanglingReference;
+  bool handleException;
+  Map<String, Set<String>> possibleTypes;
+  List<OptimisticPatch> optimisticPatches;
+  Map<String, dynamic> cache;
+
+  DenormalizeJob({
+    this.optimistic = false,
+    required this.document,
+    this.operationName,
+    this.variables = const {},
+    this.typePolicies = const {},
+    this.dataIdFromObject,
+    this.addTypename = false,
+    this.returnPartialData = false,
+    this.allowDanglingReference = false,
+    this.handleException = true,
+    this.possibleTypes = const {},
+    this.optimisticPatches = const [],
+    this.cache = const {},
+  });
+
+  @override
+  Future<Map<String, dynamic>?> job() async {
+    return _denormalizeOperation();
+  }
+
+  Map<String, dynamic>? _denormalizeOperation() {
+    return denormalizeOperation(
+      read: (String dataId) => GraphQLCache.readIsolateNormalized(
+        dataId,
+        optimistic: optimistic,
+        optimisticPatches: optimisticPatches,
+      ),
+      document: document,
+      operationName: operationName,
+      variables: variables,
+      typePolicies: typePolicies,
+      dataIdFromObject: dataIdFromObject,
+      addTypename: addTypename,
+      returnPartialData: returnPartialData,
+      allowDanglingReference: allowDanglingReference,
+      handleException: handleException,
+      possibleTypes: possibleTypes,
+      cache: cache,
+    );
+  }
+}
 
 class QueryManager {
   QueryManager({
     required this.link,
     required this.cache,
     this.alwaysRebroadcast = false,
-  }) {
+    bool useIsolate = true,
+  }) : _poolFuture = _initPool(useIsolate) {
+    isolatePool = _poolFuture;
     scheduler = QueryScheduler(
       queryManager: this,
     );
@@ -36,6 +128,7 @@ class QueryManager {
 
   final Link link;
   final GraphQLCache cache;
+  final Future<IsolatePool?> _poolFuture;
 
   /// Whether to skip deep equality checks in [maybeRebroadcastQueries]
   final bool alwaysRebroadcast;
@@ -50,6 +143,16 @@ class QueryManager {
 
   /// prevents rebroadcasting for some intensive bulk operation like [refetchSafeQueries]
   bool rebroadcastLocked = false;
+
+  static Future<IsolatePool?> _initPool(bool useIsolate) async {
+    if (!useIsolate) {
+      return null;
+    }
+    // Always 1 because we use memory techniques
+    final pool = IsolatePool(1);
+    await pool.start();
+    return pool;
+  }
 
   ObservableQuery<TParsed> watchQuery<TParsed>(
       WatchQueryOptions<TParsed> options) {
@@ -139,6 +242,7 @@ class QueryManager {
             )),
           ))
           .map((QueryResult<TParsed> queryResult) {
+            // TODO: await?
             maybeRebroadcastQueries();
             return queryResult;
           });
@@ -162,12 +266,12 @@ class QueryManager {
         eagerResult.isLoading) {
       final result = networkResult ?? eagerResult;
       await result;
-      maybeRebroadcastQueries();
+      await maybeRebroadcastQueries();
       return result;
     }
-    maybeRebroadcastQueries();
+    await maybeRebroadcastQueries();
     if (networkResult is Future<QueryResult<TParsed>>) {
-      networkResult.then((value) => maybeRebroadcastQueries());
+      networkResult.then((value) async => await maybeRebroadcastQueries());
     }
     return eagerResult;
   }
@@ -190,7 +294,7 @@ class QueryManager {
     }
 
     /// wait until callbacks complete to rebroadcast
-    maybeRebroadcastQueries();
+    await maybeRebroadcastQueries();
 
     return result;
   }
@@ -404,7 +508,7 @@ class QueryManager {
       queries.values.where((q) => q.isRefetchSafe).map((q) => q.refetch()),
     );
     rebroadcastLocked = false;
-    maybeRebroadcastQueries();
+    await maybeRebroadcastQueries();
     return results;
   }
 
@@ -481,10 +585,10 @@ class QueryManager {
   /// **Note on internal implementation details**:
   /// There is sometimes confusion on when this is called, but rebroadcasts are requested
   /// from every [addQueryResult] where `result.isNotLoading` as an [OnData] callback from [ObservableQuery].
-  bool maybeRebroadcastQueries({
+  Future<bool> maybeRebroadcastQueries({
     ObservableQuery<Object?>? exclude,
     bool force = false,
-  }) {
+  }) async {
     if (rebroadcastLocked && !force) {
       return false;
     }
@@ -495,10 +599,36 @@ class QueryManager {
       return false;
     }
 
+    int readTime = 0;
+    normalizedReadDuration = 0;
+
+    final pool = await _poolFuture;
+
+    // Create a version of the cache which uses an InMemoryStore instead
+    // of a HiveStore. It copies all the data over.
+    // final newStore = InMemoryStore();
+    // final existingData = cache.store.toMap();
+    // newStore.putAll(existingData);
+    // final newCache = GraphQLCache(
+    //   store: newStore,
+    //   dataIdFromObject: cache.dataIdFromObject,
+    //   possibleTypes: cache.possibleTypes,
+    //   typePolicies: cache.typePolicies,
+    //   partialDataPolicy: cache.partialDataPolicy,
+    // );
+    // if (pool != null) {
+    //   final warmUpStopwatch = Stopwatch()..start();
+    //   await pool.scheduleJob<void>(WarmUpIsolateCacheJob(newCache));
+    //   warmUpStopwatch.stop();
+    //   print("Warm Up Time: ${warmUpStopwatch.elapsedMilliseconds}ms");
+    // }
+
     // If two ObservableQueries are backed by the same [Request], we only need
     // to [readQuery] for it once.
     final Map<Request, QueryResult<Object?>> diffQueryResultCache = {};
     final Map<Request, bool> ignoreQueryResults = {};
+
+    final Map<String, dynamic> memoizedDenormalizedCache = {};
     for (final query in queries.values) {
       final Request request = query.options.asRequest;
       final cachedQueryResult = diffQueryResultCache[request];
@@ -518,10 +648,42 @@ class QueryManager {
         continue;
       } else {
         // We haven't seen this one yet, denormalize from cache and diff
-        final cachedData = cache.readQuery(
-          query.options.asRequest,
-          optimistic: query.options.policies.mergeOptimisticData,
-        );
+        final Map<String, dynamic>? cachedData;
+        final readStopwatch = Stopwatch()..start();
+        if (pool != null) {
+          // cachedData = await pool.scheduleJob(ReadCacheJob(request,
+          //     optimistic: query.options.policies.mergeOptimisticData,));
+
+          cachedData = await pool.scheduleJob(DenormalizeJob(
+            typePolicies: cache.typePolicies,
+            dataIdFromObject: cache.dataIdFromObject,
+            returnPartialData: cache.returnPartialData,
+            addTypename: cache.addTypename,
+            // if there is partial data, we cannot read and return null
+            handleException: true,
+            // provided from request
+            document: request.operation.document,
+            operationName: request.operation.operationName,
+            variables: cache.sanitizeVariables(request.variables)!,
+            possibleTypes: cache.possibleTypes,
+            cache: memoizedDenormalizedCache,
+            optimisticPatches: cache.optimisticPatches,
+            optimistic: query.options.policies.mergeOptimisticData,
+          ));
+        } else {
+          cachedData = cache.readQuery(
+            query.options.asRequest,
+            optimistic: query.options.policies.mergeOptimisticData,
+            cache: memoizedDenormalizedCache,
+          );
+        }
+
+        // final cachedData = cache.readQuery(
+        //   query.options.asRequest,
+        //   optimistic: query.options.policies.mergeOptimisticData,
+        // );
+        readTime += readStopwatch.elapsedMilliseconds;
+        readStopwatch.stop();
         if (_cachedDataHasChangedFor(query, cachedData)) {
           // The data has changed
           final queryResult = QueryResult(
@@ -541,6 +703,9 @@ class QueryManager {
         }
       }
     }
+    print("Read Time: ${readTime}ms");
+    // print("readNormalized Time: ${normalizedReadDuration}ms");
+    normalizedReadDuration = 0;
     return true;
   }
 

@@ -22,6 +22,7 @@ dependencies:
   stream_channel: ^2.1.0
   rxdart: ^0.27.1
   uuid: ^4.0.0
+  isolate_pool_2: ^1.0.7
 
 dev_dependencies:
   async: ^2.5.0

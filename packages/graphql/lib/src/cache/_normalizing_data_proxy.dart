@@ -81,6 +81,7 @@ abstract class NormalizingDataProxy extends GraphQLDataProxy {
   Map<String, dynamic>? readQuery(
     Request request, {
     bool optimistic = true,
+    Map<String, dynamic>? cache,
   }) =>
       denormalizeOperation(
         // provided from cache
@@ -96,6 +97,7 @@ abstract class NormalizingDataProxy extends GraphQLDataProxy {
         operationName: request.operation.operationName,
         variables: sanitizeVariables(request.variables)!,
         possibleTypes: possibleTypes,
+        cache: cache,
       );
 
   Map<String, dynamic>? readFragment(

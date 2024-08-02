@@ -1,5 +1,6 @@
 import 'package:collection/collection.dart' show IterableExtension;
 import 'package:graphql/src/cache/_normalizing_data_proxy.dart';
+import 'package:isolate_pool_2/isolate_pool_2.dart';
 import 'package:meta/meta.dart';
 
 import 'package:graphql/src/utilities/helpers.dart';
@@ -14,6 +15,32 @@ export 'package:graphql/src/cache/hive_store.dart';
 export 'package:graphql/src/cache/fragment.dart';
 
 typedef VariableEncoder = Object Function(Object t);
+
+int normalizedReadDuration = 0;
+
+InMemoryStore _isolateStore = InMemoryStore();
+Future<IsolatePool?>? isolatePool = null;
+
+class PutToStore extends PooledJob<void> {
+  String dataId;
+  Map<String, dynamic>? value;
+  PutToStore(this.dataId, this.value);
+
+  @override
+  Future<void> job() async {
+    _isolateStore.put(dataId, value);
+  }
+}
+
+class GetFromStore extends PooledJob<Map<String, dynamic>?> {
+  String dataId;
+  GetFromStore(this.dataId);
+
+  @override
+  Future<Map<String, dynamic>?> job() async {
+    return _isolateStore.get(dataId);
+  }
+}
 
 /// Optimistic GraphQL Entity cache with [normalize] [TypePolicy] support
 /// and configurable [store].
@@ -105,6 +132,35 @@ class GraphQLCache extends NormalizingDataProxy {
   @visibleForTesting
   List<OptimisticPatch> optimisticPatches = [];
 
+  static Map<String, dynamic>? readIsolateNormalized(
+    String rootId, {
+    bool? optimistic = true,
+    List<OptimisticPatch> optimisticPatches = const [],
+  }) {
+    var value = _isolateStore.get(rootId);
+
+    if (!optimistic!) {
+      return value;
+    }
+
+    for (final patch in optimisticPatches) {
+      if (patch.data.containsKey(rootId)) {
+        final patchData = patch.data[rootId];
+        if (value is Map<String, Object> && patchData is Map<String, Object>) {
+          value = deeplyMergeLeft([
+            value,
+            patchData,
+          ]);
+        } else {
+          // Overwrite if not mergable
+          value = patchData;
+        }
+      }
+    }
+
+    return value;
+  }
+
   /// Reads dereferences an entity from the first valid optimistic layer,
   /// defaulting to the base internal HashMap.
   Map<String, dynamic>? readNormalized(
@@ -146,8 +202,13 @@ class GraphQLCache extends NormalizingDataProxy {
         dataId,
         existing != null ? deeplyMergeLeft([existing, value]) : value,
       );
+      isolatePool?.then((pool) => pool?.scheduleJob(PutToStore(
+            dataId,
+            existing != null ? deeplyMergeLeft([existing, value]) : value,
+          )));
     } else {
       store.put(dataId, value);
+      isolatePool?.then((pool) => pool?.scheduleJob(PutToStore(dataId, value)));
     }
   }
 
